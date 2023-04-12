@@ -315,6 +315,14 @@ __device__ vec3 network_to_rgb_vec(const T& val, ENerfActivation activation) {
 	};
 }
 
+template <typename T>
+__device__ vec2 network_to_uv_vec(const T& val) {
+	return {
+		float(val[4]),
+		float(val[5])
+	};
+}
+
 __device__ vec3 warp_position(const vec3& pos, const BoundingBox& aabb) {
 	// return {tcnn::logistic(pos.x - 0.5f), tcnn::logistic(pos.y - 0.5f), tcnn::logistic(pos.z - 0.5f)};
 	// return pos;
@@ -882,6 +890,7 @@ __global__ void composite_kernel_nerf(
 	float depth_scale,
 	vec4* __restrict__ rgba,
 	float* __restrict__ depth,
+	vec2* __restrict__ uv,
 	NerfPayload* payloads,
 	PitchedPtr<NerfCoordinate> network_input,
 	const tcnn::network_precision_t* __restrict__ network_output,
@@ -905,6 +914,7 @@ __global__ void composite_kernel_nerf(
 
 	vec4 local_rgba = rgba[i];
 	float local_depth = depth[i];
+	vec2 local_uv = uv[i];
 	vec3 origin = payload.origin;
 	vec3 cam_fwd = camera_matrix[2];
 	// Composite in the last n steps
@@ -912,11 +922,14 @@ __global__ void composite_kernel_nerf(
 	uint32_t j = 0;
 
 	for (; j < actual_n_steps; ++j) {
-		tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output;
+		tcnn::vector_t<tcnn::network_precision_t, 6> local_network_output;
 		local_network_output[0] = network_output[i + j * n_elements + 0 * stride];
 		local_network_output[1] = network_output[i + j * n_elements + 1 * stride];
 		local_network_output[2] = network_output[i + j * n_elements + 2 * stride];
 		local_network_output[3] = network_output[i + j * n_elements + 3 * stride];
+		local_network_output[4] = network_output[i + j * n_elements + 4 * stride];
+		local_network_output[5] = network_output[i + j * n_elements + 5 * stride];
+
 		const NerfCoordinate* input = network_input(i + j * n_elements);
 		vec3 warped_pos = input->pos.p;
 		vec3 pos = unwarp_position(warped_pos, aabb);
@@ -1055,6 +1068,9 @@ __global__ void composite_kernel_nerf(
 			rgb = vec3(dot(cam_fwd, pos - origin) * depth_scale);
 		} else if (render_mode == ERenderMode::AO) {
 			rgb = vec3(alpha);
+		} else if (render_mode == ERenderMode::UV) {
+			vec2 step_uv = network_to_uv_vec(local_network_output);
+			local_uv += weight * step_uv;
 		}
 
 		local_rgba += vec4(rgb * weight, weight);
@@ -1076,6 +1092,7 @@ __global__ void composite_kernel_nerf(
 
 	rgba[i] = local_rgba;
 	depth[i] = local_depth;
+	uv[i] = local_uv;
 }
 
 static constexpr float UNIFORM_SAMPLING_FRACTION = 0.5f;
@@ -1819,6 +1836,7 @@ __global__ void shade_kernel_nerf(
 	const uint32_t n_elements,
 	vec4* __restrict__ rgba,
 	float* __restrict__ depth,
+	vec2* __restrict__ uv,
 	NerfPayload* __restrict__ payloads,
 	ERenderMode render_mode,
 	bool train_in_linear_colors,
@@ -1837,6 +1855,9 @@ __global__ void shade_kernel_nerf(
 		float col = (float)payload.n_steps / 128;
 		tmp = {col, col, col, 1.0f};
 	}
+	else if (render_mode == ERenderMode::UV) {
+		tmp = { uv[i].x, uv[i].y, 0.0f, 1.0f };
+	}
 
 	if (!train_in_linear_colors && (render_mode == ERenderMode::Shade || render_mode == ERenderMode::Slice)) {
 		// Accumulate in linear colors
@@ -1851,9 +1872,9 @@ __global__ void shade_kernel_nerf(
 
 __global__ void compact_kernel_nerf(
 	const uint32_t n_elements,
-	vec4* src_rgba, float* src_depth, NerfPayload* src_payloads,
-	vec4* dst_rgba, float* dst_depth, NerfPayload* dst_payloads,
-	vec4* dst_final_rgba, float* dst_final_depth, NerfPayload* dst_final_payloads,
+	vec4* src_rgba, float* src_depth, vec2* src_uv, NerfPayload* src_payloads,
+	vec4* dst_rgba, float* dst_depth, vec2* dst_uv, NerfPayload* dst_payloads,
+	vec4* dst_final_rgba, float* dst_final_depth, vec2* dst_final_uv, NerfPayload* dst_final_payloads,
 	uint32_t* counter, uint32_t* finalCounter
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -1866,11 +1887,13 @@ __global__ void compact_kernel_nerf(
 		dst_payloads[idx] = src_payload;
 		dst_rgba[idx] = src_rgba[i];
 		dst_depth[idx] = src_depth[i];
+		dst_uv[idx] = src_uv[i];
 	} else if (src_rgba[i].a > 0.001f) {
 		uint32_t idx = atomicAdd(finalCounter, 1);
 		dst_final_payloads[idx] = src_payload;
 		dst_final_rgba[idx] = src_rgba[i];
 		dst_final_depth[idx] = src_depth[i];
+		dst_final_uv[idx] = src_uv[i];
 	}
 }
 
@@ -2123,6 +2146,7 @@ void Testbed::NerfTracer::init_rays_from_camera(
 
 	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, m_n_rays_initialized * sizeof(vec4), stream));
 	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, m_n_rays_initialized * sizeof(float), stream));
+	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].uv, 0, m_n_rays_initialized * sizeof(vec2), stream));
 
 	linear_kernel(advance_pos_nerf_kernel, 0, stream,
 		m_n_rays_initialized,
@@ -2183,9 +2207,9 @@ uint32_t Testbed::NerfTracer::trace(
 			CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
 			linear_kernel(compact_kernel_nerf, 0, stream,
 				n_alive,
-				rays_tmp.rgba, rays_tmp.depth, rays_tmp.payload,
-				rays_current.rgba, rays_current.depth, rays_current.payload,
-				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.payload,
+				rays_tmp.rgba, rays_tmp.depth, rays_tmp.uv, rays_tmp.payload,
+				rays_current.rgba, rays_current.depth, rays_current.uv, rays_current.payload,
+				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.uv, m_rays_hit.payload,
 				m_alive_counter, m_hit_counter
 			);
 			CUDA_CHECK_THROW(cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
@@ -2241,6 +2265,7 @@ uint32_t Testbed::NerfTracer::trace(
 			depth_scale,
 			rays_current.rgba,
 			rays_current.depth,
+			rays_current.uv,
 			rays_current.payload,
 			input_data,
 			m_network_output,
@@ -2267,9 +2292,9 @@ void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_widt
 	n_elements = next_multiple(n_elements, size_t(tcnn::batch_size_granularity));
 	size_t num_floats = sizeof(NerfCoordinate) / sizeof(float) + n_extra_dims;
 	auto scratch = allocate_workspace_and_distribute<
-		vec4, float, NerfPayload, // m_rays[0]
-		vec4, float, NerfPayload, // m_rays[1]
-		vec4, float, NerfPayload, // m_rays_hit
+		vec4, float, vec2, NerfPayload, // m_rays[0]
+		vec4, float, vec2, NerfPayload, // m_rays[1]
+		vec4, float, vec2, NerfPayload, // m_rays_hit
 
 		network_precision_t,
 		float,
@@ -2277,24 +2302,24 @@ void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_widt
 		uint32_t
 	>(
 		stream, &m_scratch_alloc,
-		n_elements, n_elements, n_elements,
-		n_elements, n_elements, n_elements,
-		n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements, n_elements,
 		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * padded_output_width,
 		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * num_floats,
 		32, // 2 full cache lines to ensure no overlap
 		32  // 2 full cache lines to ensure no overlap
 	);
 
-	m_rays[0].set(std::get<0>(scratch), std::get<1>(scratch), std::get<2>(scratch), n_elements);
-	m_rays[1].set(std::get<3>(scratch), std::get<4>(scratch), std::get<5>(scratch), n_elements);
-	m_rays_hit.set(std::get<6>(scratch), std::get<7>(scratch), std::get<8>(scratch), n_elements);
+	m_rays[0].set(std::get<0>(scratch), std::get<1>(scratch), std::get<2>(scratch), std::get<3>(scratch), n_elements);
+	m_rays[1].set(std::get<4>(scratch), std::get<5>(scratch), std::get<6>(scratch), std::get<7>(scratch), n_elements);
+	m_rays_hit.set(std::get<8>(scratch), std::get<9>(scratch), std::get<10>(scratch), std::get<11>(scratch), n_elements);
 
-	m_network_output = std::get<9>(scratch);
-	m_network_input = std::get<10>(scratch);
+	m_network_output = std::get<12>(scratch);
+	m_network_input = std::get<13>(scratch);
 
-	m_hit_counter = std::get<11>(scratch);
-	m_alive_counter = std::get<12>(scratch);
+	m_hit_counter = std::get<14>(scratch);
+	m_alive_counter = std::get<15>(scratch);
 }
 
 void Testbed::Nerf::Training::reset_extra_dims(default_rng_t& rng) {
@@ -2466,6 +2491,7 @@ void Testbed::render_nerf(
 			n_hit,
 			(vec4*)rgbsigma_matrix.data(),
 			nullptr,
+			nullptr,
 			rays_hit.payload,
 			m_render_mode,
 			m_nerf.training.linear_colors,
@@ -2479,6 +2505,7 @@ void Testbed::render_nerf(
 		n_hit,
 		rays_hit.rgba,
 		rays_hit.depth,
+		rays_hit.uv,
 		rays_hit.payload,
 		m_render_mode,
 		m_nerf.training.linear_colors,
@@ -3193,6 +3220,10 @@ void Testbed::train_nerf(uint32_t target_batch_size, bool get_loss_scalar, cudaS
 }
 
 void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters& counters, cudaStream_t stream) {
+
+	//update some params
+	m_nerf_network->set_uv_network_scale(m_nerf.training.uv_network_scale);
+
 	const uint32_t padded_output_width = m_network->padded_output_width();
 	const uint32_t max_samples = target_batch_size * 16; // Somewhat of a worst case
 	const uint32_t floats_per_coord = sizeof(NerfCoordinate) / sizeof(float) + m_nerf_network->n_extra_dims();

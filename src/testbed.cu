@@ -993,6 +993,7 @@ void Testbed::imgui() {
 			ImGui::SameLine();
 			ImGui::Checkbox("Snap to pixel centers", &m_nerf.training.snap_to_pixel_centers);
 			ImGui::SliderFloat("Near distance", &m_nerf.training.near_distance, 0.0f, 1.0f);
+			ImGui::SliderFloat("UV net grad scale", &m_nerf.training.uv_network_scale, 0.0f, 1.0f);
 			accum_reset |= ImGui::Checkbox("Linear colors", &m_nerf.training.linear_colors);
 			ImGui::Combo("Loss", (int*)&m_nerf.training.loss_type, LossTypeStr);
 			ImGui::Combo("Depth Loss", (int*)&m_nerf.training.depth_loss_type, LossTypeStr);
@@ -1440,6 +1441,68 @@ void Testbed::imgui() {
 
 				if (m_nerf.glow_mode && ImGui::SliderFloat("Glow height", &m_nerf.glow_y_cutoff, -2.f, 3.f)) {
 					accum_reset = true;
+				}
+			}
+
+			ImGui::TreePop();
+		}
+
+		if (ImGui::TreeNode("Texture visualization")) {
+			if (!m_nerf.uv_texture) {
+				m_nerf.uv_texture = std::make_shared<GLTexture>();
+				m_nerf.uv_texture->resize(ivec2{ m_nerf.uv_texture_size, m_nerf.uv_texture_size }, 4);
+			}
+
+			ImGuiIO& io = ImGui::GetIO();
+			float my_tex_w = (float)m_nerf.uv_texture_size;
+			float my_tex_h = my_tex_w;
+
+			if(m_nerf.uv_texture) {
+				static ImVec4 center_color;
+
+				//TODO: move somewhere
+				//retrive texture
+				vec3 dir = (view_dir() + vec3(1.0f)) * 0.5f;
+				GPUMatrix<float> rgba(4, m_nerf.uv_texture_size* m_nerf.uv_texture_size);
+				m_nerf_network->uv2texture(m_stream.get(), m_nerf.uv_texture_size, dir, rgba);
+
+				uint32_t width_bytes = 4 * m_nerf.uv_texture_size * sizeof(float);
+				cudaArray_t tex_array = m_nerf.uv_texture->array();
+
+				CUDA_CHECK_THROW(cudaMemcpy2DToArrayAsync(tex_array, 0, 0, rgba.data(), width_bytes, width_bytes, m_nerf.uv_texture_size, cudaMemcpyDeviceToDevice, m_stream.get()));
+				m_nerf.uv_texture->blit_from_cuda_mapping();
+				ImTextureID my_tex_id = (void*)m_nerf.uv_texture->texture();
+
+				ImVec2 pos = ImGui::GetCursorScreenPos();
+				ImVec2 uv = ImVec2((io.MousePos.x - pos.x) / my_tex_w, (io.MousePos.y - pos.y) / my_tex_h);
+				uv.x = tcnn::clamp(uv.x, 0.0f, 1.0f);
+				uv.y = tcnn::clamp(uv.y, 0.0f, 1.0f);
+
+				center_color = ImVec4(uv.x, uv.y, 0.f, 1.f);
+				ImGui::Text("center: [%.2f, %.2f]", uv.x, uv.y);
+				ImGui::SameLine();
+				ImGui::ColorButton("centeruv", *(ImVec4*)&center_color, ImGuiColorEditFlags_NoBorder, ImVec2(20, 20));
+
+				ImVec2 uv_min = ImVec2(0.0f, 0.0f);                 // Top-left
+				ImVec2 uv_max = ImVec2(1.0f, 1.0f);                 // Lower-right
+				ImVec4 tint_col = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);   // No tint
+				ImVec4 border_col = ImGui::GetStyleColorVec4(ImGuiCol_Border);
+				ImGui::Image(my_tex_id, ImVec2(my_tex_w, my_tex_h), uv_min, uv_max, tint_col, border_col);
+				if (ImGui::IsItemHovered()) {
+					ImGui::BeginTooltip();
+					float region_sz = 16.0f;
+					float region_x = io.MousePos.x - pos.x - region_sz * 0.5f;
+					float region_y = io.MousePos.y - pos.y - region_sz * 0.5f;
+					float zoom = 8.0f;
+					if (region_x < 0.0f) { region_x = 0.0f; }
+					else if (region_x > my_tex_w - region_sz) { region_x = my_tex_w - region_sz; }
+					if (region_y < 0.0f) { region_y = 0.0f; }
+					else if (region_y > my_tex_h - region_sz) { region_y = my_tex_h - region_sz; }
+
+					ImVec2 uv0 = ImVec2((region_x) / my_tex_w, (region_y) / my_tex_h);
+					ImVec2 uv1 = ImVec2((region_x + region_sz) / my_tex_w, (region_y + region_sz) / my_tex_h);
+					ImGui::Image(my_tex_id, ImVec2(region_sz * zoom, region_sz * zoom), uv0, uv1, tint_col, border_col);
+					ImGui::EndTooltip();
 				}
 			}
 
@@ -3701,6 +3764,9 @@ void Testbed::reset_network(bool clear_density_grid) {
 		json& dir_encoding_config = config["dir_encoding"];
 		json& rgb_network_config = config["rgb_network"];
 
+		//json& uv_encoding_config = config["uv_encoding"];
+		json& uv_network_config = config["uv_network"];
+
 		uint32_t n_dir_dims = 3;
 		uint32_t n_extra_dims = m_nerf.training.dataset.n_extra_dims();
 
@@ -3712,8 +3778,10 @@ void Testbed::reset_network(bool clear_density_grid) {
 				n_extra_dims,
 				dims.n_pos + 1, // The offset of 1 comes from the dt member variable of NerfCoordinate. HACKY
 				encoding_config,
+				//uv_encoding_config,
 				dir_encoding_config,
 				network_config,
+				uv_network_config,
 				rgb_network_config
 			));
 		}
@@ -4636,12 +4704,12 @@ void Testbed::gather_histograms() {
 	if (hg_enc && m_trainer->params()) {
 		std::vector<float> grid(n_encoding_params);
 
-		uint32_t m = m_network->layer_sizes().front().first;
-		uint32_t n = m_network->layer_sizes().front().second;
-		std::vector<float> first_layer_rm(m * n);
+		//uint32_t m = m_network->layer_sizes().front().first;
+		//uint32_t n = m_network->layer_sizes().front().second;
+		//std::vector<float> first_layer_rm(m * n);
 
 		CUDA_CHECK_THROW(cudaMemcpyAsync(grid.data(), m_trainer->params() + first_encoder, grid.size() * sizeof(float), cudaMemcpyDeviceToHost, m_stream.get()));
-		CUDA_CHECK_THROW(cudaMemcpyAsync(first_layer_rm.data(), m_trainer->params(), first_layer_rm.size() * sizeof(float), cudaMemcpyDeviceToHost, m_stream.get()));
+		//CUDA_CHECK_THROW(cudaMemcpyAsync(first_layer_rm.data(), m_trainer->params(), first_layer_rm.size() * sizeof(float), cudaMemcpyDeviceToHost, m_stream.get()));
 		CUDA_CHECK_THROW(cudaStreamSynchronize(m_stream.get()));
 
 

@@ -585,7 +585,7 @@ public:
 	ERenderMode m_render_mode = ERenderMode::Shade;
 	EMeshRenderMode m_mesh_render_mode = EMeshRenderMode::VertexNormals;
 
-	uint32_t m_seed = 1337;
+	uint32_t m_seed = 404;
 
 #ifdef NGP_GUI
 	GLFWwindow* m_glfw_window = nullptr;
@@ -709,6 +709,7 @@ public:
 			uint32_t n_rays_since_error_map_update = 0;
 
 			float near_distance = 0.1f;
+			float uv_network_scale = 1.0f;
 			float density_grid_decay = 0.95f;
 			default_rng_t density_grid_rng;
 			int view = 0;
@@ -760,6 +761,9 @@ public:
 
 		float glow_y_cutoff = 0.f;
 		int glow_mode = 0;
+
+		uint32_t uv_texture_size = 512;
+		std::shared_ptr<GLTexture> uv_texture = nullptr;
 
 	} m_nerf;
 

@@ -110,6 +110,7 @@ static constexpr const char* GroundTruthRenderModeStr = "Shade\0Depth\0\0";
 enum class ERenderMode : int {
 	AO,
 	Shade,
+	UV,
 	Normals,
 	Positions,
 	Depth,
@@ -119,7 +120,7 @@ enum class ERenderMode : int {
 	NumRenderModes,
 	EncodingVis, // EncodingVis exists outside of the standard render modes
 };
-static constexpr const char* RenderModeStr = "AO\0Shade\0Normals\0Positions\0Depth\0Distortion\0Cost\0Slice\0\0";
+static constexpr const char* RenderModeStr = "AO\0Shade\0UV\0Normals\0Positions\0Depth\0Distortion\0Cost\0Slice\0\0";
 
 enum class ERandomMode : int {
 	Random,
