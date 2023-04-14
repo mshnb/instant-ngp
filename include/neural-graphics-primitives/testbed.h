@@ -425,6 +425,8 @@ public:
 	void train_image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void set_train(bool mtrain);
 
+	GLuint extract_texture(cudaStream_t stream);
+
 	template <typename T>
 	void dump_parameters_as_images(const T* params, const std::string& filename_base);
 
@@ -585,7 +587,7 @@ public:
 	ERenderMode m_render_mode = ERenderMode::Shade;
 	EMeshRenderMode m_mesh_render_mode = EMeshRenderMode::VertexNormals;
 
-	uint32_t m_seed = 404;
+	uint32_t m_seed = 1337;
 
 #ifdef NGP_GUI
 	GLFWwindow* m_glfw_window = nullptr;

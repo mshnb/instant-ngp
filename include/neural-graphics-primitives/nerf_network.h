@@ -145,26 +145,6 @@ __global__ void generate_uv_grid(
 }
 
 template <typename T>
-__global__ void extract_texture(
-	const uint32_t n_elements,
-	const uint32_t input_stride,
-	const uint32_t output_stride,
-	const T* input,
-	float* output
-) {
-	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-	if (i >= n_elements) return;
-
-	const T* pixel_i = &input[i * input_stride];
-	float* pixel_o = &output[i * output_stride];
-
-	pixel_o[0] = (float)pixel_i[0];
-	pixel_o[1] = (float)pixel_i[1];
-	pixel_o[2] = (float)pixel_i[2];
-	pixel_o[3] = 1.f;
-}
-
-template <typename T>
 class NerfNetwork : public tcnn::Network<float, T> {
 public:
 	using json = nlohmann::json;
@@ -650,7 +630,7 @@ public:
 		}
 	}
 
-	void uv2texture(cudaStream_t stream, uint32_t texture_size, const vec3& dir, tcnn::GPUMatrixDynamic<float>& output) {
+	void uv2texture(cudaStream_t stream, uint32_t texture_size, const vec3& dir, tcnn::GPUMatrixDynamic<T>& output) {
 		uint32_t batch_size = output.n();
 
 		tcnn::GPUMatrixDynamic<float> dir_encoding_input{ m_dir_encoding->input_width(), batch_size, stream };
@@ -682,19 +662,10 @@ public:
 		CUDA_CHECK_THROW(cudaMemcpyAsync(uv_grid.data(), m_uv_grid.data(), m_uv_grid.n_bytes(), cudaMemcpyDeviceToDevice, stream));
 		fill_unused_rgb_input(stream, rgb_network_input.data(), batch_size);
 
-		tcnn::GPUMatrixDynamic<T> rgb_network_output{ m_rgb_network->padded_output_width(), batch_size, stream }; //cm
 		m_rgb_network->inference_mixed_precision(
 			stream,
 			rgb_network_input,
-			rgb_network_output
-		);
-
-		tcnn::linear_kernel(extract_texture<T>, 0, stream,
-			batch_size,
-			rgb_network_output.m(),
-			output.m(),
-			rgb_network_output.data(),
-			output.data()
+			output
 		);
 	}
 

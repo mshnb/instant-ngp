@@ -917,6 +917,7 @@ __global__ void composite_kernel_nerf(
 	vec2 local_uv = uv[i];
 	vec3 origin = payload.origin;
 	vec3 cam_fwd = camera_matrix[2];
+
 	// Composite in the last n steps
 	uint32_t actual_n_steps = payload.n_steps;
 	uint32_t j = 0;
@@ -941,7 +942,6 @@ __global__ void composite_kernel_nerf(
 			alpha = 1.f;
 		}
 		float weight = alpha * T;
-
 		vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 
 		if (glow_mode) { // random grid visualizations ftw!
@@ -3715,6 +3715,57 @@ int Testbed::find_best_training_view(int default_view) {
 		}
 	}
 	return bestimage;
+}
+
+__global__ void extract_rgb(
+	const uint32_t n_elements,
+	const uint32_t input_stride,
+	const uint32_t output_stride,
+	const network_precision_t* input,
+	float* output,
+	ENerfActivation rgb_activation
+) {
+	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
+	if (i >= n_elements) return;
+
+	const network_precision_t* pixel_i = &input[i * input_stride];
+	float* pixel_o = &output[i * output_stride];
+
+	pixel_o[0] = network_to_rgb((float)pixel_i[0], rgb_activation);
+	pixel_o[1] = network_to_rgb((float)pixel_i[1], rgb_activation);
+	pixel_o[2] = network_to_rgb((float)pixel_i[2], rgb_activation);
+	pixel_o[3] = 1.f;
+}
+
+GLuint Testbed::extract_texture(cudaStream_t stream) {
+	if (!m_nerf.uv_texture) {
+		m_nerf.uv_texture = std::make_shared<GLTexture>();
+		m_nerf.uv_texture->resize(ivec2{ m_nerf.uv_texture_size, m_nerf.uv_texture_size }, 4);
+	}
+
+	//retrive texture
+	vec3 dir = (view_dir() + vec3(1.0f)) * 0.5f;
+	uint32_t batch_size = m_nerf.uv_texture_size * m_nerf.uv_texture_size;
+	GPUMatrix<network_precision_t> rgb_network_output(m_nerf_network->padded_output_width(), batch_size, stream);
+	m_nerf_network->uv2texture(stream, m_nerf.uv_texture_size, dir, rgb_network_output);
+
+	GPUMatrix<float> rgba(4, m_nerf.uv_texture_size * m_nerf.uv_texture_size, stream);
+	linear_kernel(extract_rgb, 0, stream,
+		batch_size,
+		rgb_network_output.m(),
+		4,
+		rgb_network_output.data(),
+		rgba.data(),
+		m_nerf.rgb_activation
+	);
+
+	uint32_t width_bytes = 4 * m_nerf.uv_texture_size * sizeof(float);
+	cudaArray_t tex_array = m_nerf.uv_texture->array();
+
+	CUDA_CHECK_THROW(cudaMemcpy2DToArrayAsync(tex_array, 0, 0, rgba.data(), width_bytes, width_bytes, m_nerf.uv_texture_size, cudaMemcpyDeviceToDevice, stream));
+	m_nerf.uv_texture->blit_from_cuda_mapping();
+
+	return m_nerf.uv_texture->texture();
 }
 
 NGP_NAMESPACE_END

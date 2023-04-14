@@ -1448,30 +1448,13 @@ void Testbed::imgui() {
 		}
 
 		if (ImGui::TreeNode("Texture visualization")) {
-			if (!m_nerf.uv_texture) {
-				m_nerf.uv_texture = std::make_shared<GLTexture>();
-				m_nerf.uv_texture->resize(ivec2{ m_nerf.uv_texture_size, m_nerf.uv_texture_size }, 4);
-			}
-
-			ImGuiIO& io = ImGui::GetIO();
-			float my_tex_w = (float)m_nerf.uv_texture_size;
-			float my_tex_h = my_tex_w;
-
-			if(m_nerf.uv_texture) {
+			ImTextureID my_tex_id = (void*)extract_texture(m_stream.get());
+			if (my_tex_id) {
 				static ImVec4 center_color;
 
-				//TODO: move somewhere
-				//retrive texture
-				vec3 dir = (view_dir() + vec3(1.0f)) * 0.5f;
-				GPUMatrix<float> rgba(4, m_nerf.uv_texture_size* m_nerf.uv_texture_size);
-				m_nerf_network->uv2texture(m_stream.get(), m_nerf.uv_texture_size, dir, rgba);
-
-				uint32_t width_bytes = 4 * m_nerf.uv_texture_size * sizeof(float);
-				cudaArray_t tex_array = m_nerf.uv_texture->array();
-
-				CUDA_CHECK_THROW(cudaMemcpy2DToArrayAsync(tex_array, 0, 0, rgba.data(), width_bytes, width_bytes, m_nerf.uv_texture_size, cudaMemcpyDeviceToDevice, m_stream.get()));
-				m_nerf.uv_texture->blit_from_cuda_mapping();
-				ImTextureID my_tex_id = (void*)m_nerf.uv_texture->texture();
+				ImGuiIO& io = ImGui::GetIO();
+				float my_tex_w = (float)m_nerf.uv_texture_size;
+				float my_tex_h = my_tex_w;
 
 				ImVec2 pos = ImGui::GetCursorScreenPos();
 				ImVec2 uv = ImVec2((io.MousePos.x - pos.x) / my_tex_w, (io.MousePos.y - pos.y) / my_tex_h);
