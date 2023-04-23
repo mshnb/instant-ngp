@@ -425,8 +425,6 @@ public:
 	void train_image(size_t target_batch_size, bool get_loss_scalar, cudaStream_t stream);
 	void set_train(bool mtrain);
 
-	GLuint extract_texture(cudaStream_t stream);
-
 	template <typename T>
 	void dump_parameters_as_images(const T* params, const std::string& filename_base);
 
@@ -711,7 +709,6 @@ public:
 			uint32_t n_rays_since_error_map_update = 0;
 
 			float near_distance = 0.1f;
-			float cycle_loss_scale = 1.0f;
 			float density_grid_decay = 0.95f;
 			default_rng_t density_grid_rng;
 			int view = 0;
@@ -745,7 +742,6 @@ public:
 
 		ENerfActivation rgb_activation = ENerfActivation::Exponential;
 		ENerfActivation density_activation = ENerfActivation::Exponential;
-		ENerfActivation pos_activation = ENerfActivation::None;
 
 		vec3 light_dir = vec3(0.5f);
 		uint32_t extra_dim_idx_for_inference = 0; // which training image's latent code should be presented at inference time
@@ -764,9 +760,6 @@ public:
 
 		float glow_y_cutoff = 0.f;
 		int glow_mode = 0;
-
-		uint32_t uv_texture_size = 512;
-		std::shared_ptr<GLTexture> uv_texture = nullptr;
 
 	} m_nerf;
 

@@ -48,17 +48,15 @@ struct RaysNerfSoa {
 	}
 #endif
 
-	void set(vec4* rgba, float* depth, vec2* uv, NerfPayload* payload, size_t size) {
+	void set(vec4* rgba, float* depth, NerfPayload* payload, size_t size) {
 		this->rgba = rgba;
 		this->depth = depth;
-		this->uv = uv;
 		this->payload = payload;
 		this->size = size;
 	}
 
 	vec4* rgba;
 	float* depth;
-	vec2* uv;
 	NerfPayload* payload;
 	size_t size;
 };

@@ -315,23 +315,6 @@ __device__ vec3 network_to_rgb_vec(const T& val, ENerfActivation activation) {
 	};
 }
 
-template <typename T>
-__device__ vec2 network_to_uv_vec(const T& val) {
-	return {
-		float(val[4]),
-		float(val[5])
-	};
-}
-
-template <typename T>
-__device__ vec3 network_to_pos_vec(const T& val, ENerfActivation activation) {
-	return {
-		network_to_rgb(float(val[6]), activation),
-		network_to_rgb(float(val[7]), activation),
-		network_to_rgb(float(val[8]), activation),
-	};
-}
-
 __device__ vec3 warp_position(const vec3& pos, const BoundingBox& aabb) {
 	// return {tcnn::logistic(pos.x - 0.5f), tcnn::logistic(pos.y - 0.5f), tcnn::logistic(pos.z - 0.5f)};
 	// return pos;
@@ -899,7 +882,6 @@ __global__ void composite_kernel_nerf(
 	float depth_scale,
 	vec4* __restrict__ rgba,
 	float* __restrict__ depth,
-	vec2* __restrict__ uv,
 	NerfPayload* payloads,
 	PitchedPtr<NerfCoordinate> network_input,
 	const tcnn::network_precision_t* __restrict__ network_output,
@@ -923,23 +905,18 @@ __global__ void composite_kernel_nerf(
 
 	vec4 local_rgba = rgba[i];
 	float local_depth = depth[i];
-	vec2 local_uv = uv[i];
 	vec3 origin = payload.origin;
 	vec3 cam_fwd = camera_matrix[2];
-
 	// Composite in the last n steps
 	uint32_t actual_n_steps = payload.n_steps;
 	uint32_t j = 0;
 
 	for (; j < actual_n_steps; ++j) {
-		tcnn::vector_t<tcnn::network_precision_t, 6> local_network_output;
+		tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output;
 		local_network_output[0] = network_output[i + j * n_elements + 0 * stride];
 		local_network_output[1] = network_output[i + j * n_elements + 1 * stride];
 		local_network_output[2] = network_output[i + j * n_elements + 2 * stride];
 		local_network_output[3] = network_output[i + j * n_elements + 3 * stride];
-		local_network_output[4] = network_output[i + j * n_elements + 4 * stride];
-		local_network_output[5] = network_output[i + j * n_elements + 5 * stride];
-
 		const NerfCoordinate* input = network_input(i + j * n_elements);
 		vec3 warped_pos = input->pos.p;
 		vec3 pos = unwarp_position(warped_pos, aabb);
@@ -951,6 +928,7 @@ __global__ void composite_kernel_nerf(
 			alpha = 1.f;
 		}
 		float weight = alpha * T;
+
 		vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 
 		if (glow_mode) { // random grid visualizations ftw!
@@ -1077,9 +1055,6 @@ __global__ void composite_kernel_nerf(
 			rgb = vec3(dot(cam_fwd, pos - origin) * depth_scale);
 		} else if (render_mode == ERenderMode::AO) {
 			rgb = vec3(alpha);
-		} else if (render_mode == ERenderMode::UV) {
-			vec2 step_uv = network_to_uv_vec(local_network_output);
-			local_uv += weight * step_uv;
 		}
 
 		local_rgba += vec4(rgb * weight, weight);
@@ -1101,7 +1076,6 @@ __global__ void composite_kernel_nerf(
 
 	rgba[i] = local_rgba;
 	depth[i] = local_depth;
-	uv[i] = local_uv;
 }
 
 static constexpr float UNIFORM_SAMPLING_FRACTION = 0.5f;
@@ -1407,7 +1381,6 @@ __global__ void compute_loss_kernel_train_nerf(
 	float* __restrict__ max_level_compacted_ptr,
 	ENerfActivation rgb_activation,
 	ENerfActivation density_activation,
-	ENerfActivation cycle_loss_activation,
 	bool snap_to_pixel_centers,
 	float* __restrict__ error_map,
 	const float* __restrict__ cdf_x_cond_y,
@@ -1424,8 +1397,7 @@ __global__ void compute_loss_kernel_train_nerf(
 	const vec3* __restrict__ exposure,
 	vec3* __restrict__ exposure_gradient,
 	float depth_supervision_lambda,
-	float near_distance,
-	float cycle_loss_scale
+	float near_distance
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= *rays_counter) { return; }
@@ -1442,7 +1414,6 @@ __global__ void compute_loss_kernel_train_nerf(
 	float EPSILON = 1e-4f;
 
 	vec3 rgb_ray = vec3(0.0f);
-	vec3 loss_pos_ray = vec3(0.0f);
 	vec3 hitpoint = vec3(0.0f);
 
 	float depth_ray = 0.f;
@@ -1453,12 +1424,13 @@ __global__ void compute_loss_kernel_train_nerf(
 			break;
 		}
 
-		const tcnn::vector_t<tcnn::network_precision_t, 9> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 9>*)network_output;
+		const tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 4>*)network_output;
 		const vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 		const vec3 pos = unwarp_position(coords_in.ptr->pos.p, aabb);
 		const float dt = unwarp_dt(coords_in.ptr->dt);
 		float cur_depth = distance(pos, ray_o);
 		float density = network_to_density(float(local_network_output[3]), density_activation);
+
 
 		const float alpha = 1.f - __expf(-density * dt);
 		const float weight = alpha * T;
@@ -1466,10 +1438,6 @@ __global__ void compute_loss_kernel_train_nerf(
 		hitpoint += weight * pos;
 		depth_ray += weight * cur_depth;
 		T *= (1.f - alpha);
-
-		const vec3 inverse_pos = network_to_pos_vec(local_network_output, cycle_loss_activation);
-		LossAndGradient lg_cycle = loss_and_gradient(pos, inverse_pos, ELossType::L2);
-		loss_pos_ray += weight * lg_cycle.loss;
 
 		network_output += padded_output_width;
 		coords_in += 1;
@@ -1597,12 +1565,10 @@ __global__ void compute_loss_kernel_train_nerf(
 	loss_scale /= n_rays;
 
 	const float output_l2_reg = rgb_activation == ENerfActivation::Exponential ? 1e-4f : 0.0f;
-	const float cycle_loss_l2_reg = cycle_loss_activation == ENerfActivation::Exponential ? 1e-4f : 0.0f;
 	const float output_l1_reg_density = *mean_density_ptr < NERF_MIN_OPTICAL_THICKNESS() ? 1e-4f : 0.0f;
 
 	// now do it again computing gradients
 	vec3 rgb_ray2 = { 0.f,0.f,0.f };
-	vec3 loss_pos_ray2 = { 0.f,0.f,0.f };
 	float depth_ray2 = 0.f;
 	T = 1.f;
 	for (uint32_t j = 0; j < compacted_numsteps; ++j) {
@@ -1618,7 +1584,7 @@ __global__ void compute_loss_kernel_train_nerf(
 		float depth = distance(pos, ray_o);
 
 		float dt = unwarp_dt(coord_in->dt);
-		const tcnn::vector_t<tcnn::network_precision_t, 9> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 9>*)network_output;
+		const tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 4>*)network_output;
 		const vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 		const float density = network_to_density(float(local_network_output[3]), density_activation);
 		const float alpha = 1.f - __expf(-density * dt);
@@ -1631,31 +1597,19 @@ __global__ void compute_loss_kernel_train_nerf(
 		const vec3 suffix = rgb_ray - rgb_ray2;
 		const vec3 dloss_by_drgb = weight * lg.gradient;
 
-		tcnn::vector_t<tcnn::network_precision_t, 9> local_dL_doutput;
+		tcnn::vector_t<tcnn::network_precision_t, 4> local_dL_doutput;
 
 		// chain rule to go from dloss/drgb to dloss/dmlp_output
 		local_dL_doutput[0] = loss_scale * (dloss_by_drgb.x * network_to_rgb_derivative(local_network_output[0], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[0])); // Penalize way too large color values
 		local_dL_doutput[1] = loss_scale * (dloss_by_drgb.y * network_to_rgb_derivative(local_network_output[1], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[1]));
 		local_dL_doutput[2] = loss_scale * (dloss_by_drgb.z * network_to_rgb_derivative(local_network_output[2], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[2]));
 
-		//cycle loss
-		const vec3 inverse_pos = network_to_pos_vec(local_network_output, cycle_loss_activation);
-		LossAndGradient lg_cycle = loss_and_gradient(pos, inverse_pos, ELossType::L2);
-		const vec3 dloss_by_dpos = weight * lg_cycle.gradient;
-
-		local_dL_doutput[6] = loss_scale * cycle_loss_scale * (dloss_by_dpos.x * network_to_rgb_derivative(local_network_output[6], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[6]));
-		local_dL_doutput[7] = loss_scale * cycle_loss_scale * (dloss_by_dpos.y * network_to_rgb_derivative(local_network_output[7], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[7]));
-		local_dL_doutput[8] = loss_scale * cycle_loss_scale * (dloss_by_dpos.z * network_to_rgb_derivative(local_network_output[8], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[8]));
-
-		loss_pos_ray2 += weight * lg_cycle.loss;
-		const vec3 loss_pos_suffix = loss_pos_ray - loss_pos_ray2;
-
 		float density_derivative = network_to_density_derivative(float(local_network_output[3]), density_activation);
 		const float depth_suffix = depth_ray - depth_ray2;
 		const float depth_supervision = depth_loss_gradient * (T * depth - depth_suffix);
 
 		float dloss_by_dmlp = density_derivative * (
-			dt * (dot(lg.gradient, T * rgb - suffix) + cycle_loss_scale * dot(vec3(1), T * lg_cycle.loss - loss_pos_suffix) + depth_supervision)
+			dt * (dot(lg.gradient, T * rgb - suffix) + depth_supervision)
 		);
 
 		//static constexpr float mask_supervision_strength = 1.f; // we are already 'leaking' mask information into the nerf via the random bg colors; setting this to eg between 1 and  100 encourages density towards 0 in such regions.
@@ -1665,8 +1619,9 @@ __global__ void compute_loss_kernel_train_nerf(
 			loss_scale * dloss_by_dmlp +
 			(float(local_network_output[3]) < 0.0f ? -output_l1_reg_density : 0.0f) +
 			(float(local_network_output[3]) > -10.0f && depth < near_distance ? 1e-4f : 0.0f);
+			;
 
-		*(tcnn::vector_t<tcnn::network_precision_t, 9>*)dloss_doutput = local_dL_doutput;
+		*(tcnn::vector_t<tcnn::network_precision_t, 4>*)dloss_doutput = local_dL_doutput;
 
 		dloss_doutput += padded_output_width;
 		network_output += padded_output_width;
@@ -1864,7 +1819,6 @@ __global__ void shade_kernel_nerf(
 	const uint32_t n_elements,
 	vec4* __restrict__ rgba,
 	float* __restrict__ depth,
-	vec2* __restrict__ uv,
 	NerfPayload* __restrict__ payloads,
 	ERenderMode render_mode,
 	bool train_in_linear_colors,
@@ -1883,9 +1837,6 @@ __global__ void shade_kernel_nerf(
 		float col = (float)payload.n_steps / 128;
 		tmp = {col, col, col, 1.0f};
 	}
-	else if (render_mode == ERenderMode::UV) {
-		tmp = { uv[i].x, uv[i].y, 0.0f, 1.0f };
-	}
 
 	if (!train_in_linear_colors && (render_mode == ERenderMode::Shade || render_mode == ERenderMode::Slice)) {
 		// Accumulate in linear colors
@@ -1900,9 +1851,9 @@ __global__ void shade_kernel_nerf(
 
 __global__ void compact_kernel_nerf(
 	const uint32_t n_elements,
-	vec4* src_rgba, float* src_depth, vec2* src_uv, NerfPayload* src_payloads,
-	vec4* dst_rgba, float* dst_depth, vec2* dst_uv, NerfPayload* dst_payloads,
-	vec4* dst_final_rgba, float* dst_final_depth, vec2* dst_final_uv, NerfPayload* dst_final_payloads,
+	vec4* src_rgba, float* src_depth, NerfPayload* src_payloads,
+	vec4* dst_rgba, float* dst_depth, NerfPayload* dst_payloads,
+	vec4* dst_final_rgba, float* dst_final_depth, NerfPayload* dst_final_payloads,
 	uint32_t* counter, uint32_t* finalCounter
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -1915,13 +1866,11 @@ __global__ void compact_kernel_nerf(
 		dst_payloads[idx] = src_payload;
 		dst_rgba[idx] = src_rgba[i];
 		dst_depth[idx] = src_depth[i];
-		dst_uv[idx] = src_uv[i];
 	} else if (src_rgba[i].a > 0.001f) {
 		uint32_t idx = atomicAdd(finalCounter, 1);
 		dst_final_payloads[idx] = src_payload;
 		dst_final_rgba[idx] = src_rgba[i];
 		dst_final_depth[idx] = src_depth[i];
-		dst_final_uv[idx] = src_uv[i];
 	}
 }
 
@@ -2174,7 +2123,6 @@ void Testbed::NerfTracer::init_rays_from_camera(
 
 	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].rgba, 0, m_n_rays_initialized * sizeof(vec4), stream));
 	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].depth, 0, m_n_rays_initialized * sizeof(float), stream));
-	CUDA_CHECK_THROW(cudaMemsetAsync(m_rays[0].uv, 0, m_n_rays_initialized * sizeof(vec2), stream));
 
 	linear_kernel(advance_pos_nerf_kernel, 0, stream,
 		m_n_rays_initialized,
@@ -2235,9 +2183,9 @@ uint32_t Testbed::NerfTracer::trace(
 			CUDA_CHECK_THROW(cudaMemsetAsync(m_alive_counter, 0, sizeof(uint32_t), stream));
 			linear_kernel(compact_kernel_nerf, 0, stream,
 				n_alive,
-				rays_tmp.rgba, rays_tmp.depth, rays_tmp.uv, rays_tmp.payload,
-				rays_current.rgba, rays_current.depth, rays_current.uv, rays_current.payload,
-				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.uv, m_rays_hit.payload,
+				rays_tmp.rgba, rays_tmp.depth, rays_tmp.payload,
+				rays_current.rgba, rays_current.depth, rays_current.payload,
+				m_rays_hit.rgba, m_rays_hit.depth, m_rays_hit.payload,
 				m_alive_counter, m_hit_counter
 			);
 			CUDA_CHECK_THROW(cudaMemcpyAsync(&n_alive, m_alive_counter, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
@@ -2293,7 +2241,6 @@ uint32_t Testbed::NerfTracer::trace(
 			depth_scale,
 			rays_current.rgba,
 			rays_current.depth,
-			rays_current.uv,
 			rays_current.payload,
 			input_data,
 			m_network_output,
@@ -2320,9 +2267,9 @@ void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_widt
 	n_elements = next_multiple(n_elements, size_t(tcnn::batch_size_granularity));
 	size_t num_floats = sizeof(NerfCoordinate) / sizeof(float) + n_extra_dims;
 	auto scratch = allocate_workspace_and_distribute<
-		vec4, float, vec2, NerfPayload, // m_rays[0]
-		vec4, float, vec2, NerfPayload, // m_rays[1]
-		vec4, float, vec2, NerfPayload, // m_rays_hit
+		vec4, float, NerfPayload, // m_rays[0]
+		vec4, float, NerfPayload, // m_rays[1]
+		vec4, float, NerfPayload, // m_rays_hit
 
 		network_precision_t,
 		float,
@@ -2330,24 +2277,24 @@ void Testbed::NerfTracer::enlarge(size_t n_elements, uint32_t padded_output_widt
 		uint32_t
 	>(
 		stream, &m_scratch_alloc,
-		n_elements, n_elements, n_elements, n_elements,
-		n_elements, n_elements, n_elements, n_elements,
-		n_elements, n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements,
+		n_elements, n_elements, n_elements,
 		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * padded_output_width,
 		n_elements * MAX_STEPS_INBETWEEN_COMPACTION * num_floats,
 		32, // 2 full cache lines to ensure no overlap
 		32  // 2 full cache lines to ensure no overlap
 	);
 
-	m_rays[0].set(std::get<0>(scratch), std::get<1>(scratch), std::get<2>(scratch), std::get<3>(scratch), n_elements);
-	m_rays[1].set(std::get<4>(scratch), std::get<5>(scratch), std::get<6>(scratch), std::get<7>(scratch), n_elements);
-	m_rays_hit.set(std::get<8>(scratch), std::get<9>(scratch), std::get<10>(scratch), std::get<11>(scratch), n_elements);
+	m_rays[0].set(std::get<0>(scratch), std::get<1>(scratch), std::get<2>(scratch), n_elements);
+	m_rays[1].set(std::get<3>(scratch), std::get<4>(scratch), std::get<5>(scratch), n_elements);
+	m_rays_hit.set(std::get<6>(scratch), std::get<7>(scratch), std::get<8>(scratch), n_elements);
 
-	m_network_output = std::get<12>(scratch);
-	m_network_input = std::get<13>(scratch);
+	m_network_output = std::get<9>(scratch);
+	m_network_input = std::get<10>(scratch);
 
-	m_hit_counter = std::get<14>(scratch);
-	m_alive_counter = std::get<15>(scratch);
+	m_hit_counter = std::get<11>(scratch);
+	m_alive_counter = std::get<12>(scratch);
 }
 
 void Testbed::Nerf::Training::reset_extra_dims(default_rng_t& rng) {
@@ -2519,7 +2466,6 @@ void Testbed::render_nerf(
 			n_hit,
 			(vec4*)rgbsigma_matrix.data(),
 			nullptr,
-			nullptr,
 			rays_hit.payload,
 			m_render_mode,
 			m_nerf.training.linear_colors,
@@ -2533,7 +2479,6 @@ void Testbed::render_nerf(
 		n_hit,
 		rays_hit.rgba,
 		rays_hit.depth,
-		rays_hit.uv,
 		rays_hit.payload,
 		m_render_mode,
 		m_nerf.training.linear_colors,
@@ -3405,7 +3350,6 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			max_level_compacted,
 			m_nerf.rgb_activation,
 			m_nerf.density_activation,
-			m_nerf.pos_activation,
 			m_nerf.training.snap_to_pixel_centers,
 			accumulate_error ? m_nerf.training.error_map.data.data() : nullptr,
 			sample_focal_plane_proportional_to_error ? m_nerf.training.error_map.cdf_x_cond_y.data() : nullptr,
@@ -3422,8 +3366,7 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			m_nerf.training.cam_exposure_gpu.data(),
 			m_nerf.training.optimize_exposure ? m_nerf.training.cam_exposure_gradient_gpu.data() : nullptr,
 			m_nerf.training.depth_supervision_lambda,
-			m_nerf.training.near_distance,
-			m_nerf.training.cycle_loss_scale
+			m_nerf.training.near_distance
 		);
 
 	fill_rollover_and_rescale<network_precision_t><<<n_blocks_linear(target_batch_size*padded_output_width), n_threads_linear, 0, stream>>>(
@@ -3741,57 +3684,6 @@ int Testbed::find_best_training_view(int default_view) {
 		}
 	}
 	return bestimage;
-}
-
-__global__ void extract_rgb(
-	const uint32_t n_elements,
-	const uint32_t input_stride,
-	const uint32_t output_stride,
-	const network_precision_t* input,
-	float* output,
-	ENerfActivation rgb_activation
-) {
-	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
-	if (i >= n_elements) return;
-
-	const network_precision_t* pixel_i = &input[i * input_stride];
-	float* pixel_o = &output[i * output_stride];
-
-	pixel_o[0] = network_to_rgb((float)pixel_i[0], rgb_activation);
-	pixel_o[1] = network_to_rgb((float)pixel_i[1], rgb_activation);
-	pixel_o[2] = network_to_rgb((float)pixel_i[2], rgb_activation);
-	pixel_o[3] = 1.f;
-}
-
-GLuint Testbed::extract_texture(cudaStream_t stream) {
-	if (!m_nerf.uv_texture) {
-		m_nerf.uv_texture = std::make_shared<GLTexture>();
-		m_nerf.uv_texture->resize(ivec2{ m_nerf.uv_texture_size, m_nerf.uv_texture_size }, 4);
-	}
-
-	//retrive texture
-	vec3 dir = (view_dir() + vec3(1.0f)) * 0.5f;
-	uint32_t batch_size = m_nerf.uv_texture_size * m_nerf.uv_texture_size;
-	GPUMatrix<network_precision_t> rgb_network_output(m_nerf_network->padded_output_width(), batch_size, stream);
-	m_nerf_network->uv2texture(stream, m_nerf.uv_texture_size, dir, rgb_network_output);
-
-	GPUMatrix<float> rgba(4, m_nerf.uv_texture_size * m_nerf.uv_texture_size, stream);
-	linear_kernel(extract_rgb, 0, stream,
-		batch_size,
-		rgb_network_output.m(),
-		4,
-		rgb_network_output.data(),
-		rgba.data(),
-		m_nerf.rgb_activation
-	);
-
-	uint32_t width_bytes = 4 * m_nerf.uv_texture_size * sizeof(float);
-	cudaArray_t tex_array = m_nerf.uv_texture->array();
-
-	CUDA_CHECK_THROW(cudaMemcpy2DToArrayAsync(tex_array, 0, 0, rgba.data(), width_bytes, width_bytes, m_nerf.uv_texture_size, cudaMemcpyDeviceToDevice, stream));
-	m_nerf.uv_texture->blit_from_cuda_mapping();
-
-	return m_nerf.uv_texture->texture();
 }
 
 NGP_NAMESPACE_END
