@@ -993,12 +993,13 @@ void Testbed::imgui() {
 			ImGui::SameLine();
 			ImGui::Checkbox("Snap to pixel centers", &m_nerf.training.snap_to_pixel_centers);
 			ImGui::SliderFloat("Near distance", &m_nerf.training.near_distance, 0.0f, 1.0f);
-			ImGui::SliderFloat("UV net grad scale", &m_nerf.training.uv_network_scale, 0.0f, 1.0f);
+			ImGui::SliderFloat("Cycle loss scale", &m_nerf.training.cycle_loss_scale, 0.0f, 10.0f);
 			accum_reset |= ImGui::Checkbox("Linear colors", &m_nerf.training.linear_colors);
 			ImGui::Combo("Loss", (int*)&m_nerf.training.loss_type, LossTypeStr);
 			ImGui::Combo("Depth Loss", (int*)&m_nerf.training.depth_loss_type, LossTypeStr);
 			ImGui::Combo("RGB activation", (int*)&m_nerf.rgb_activation, NerfActivationStr);
 			ImGui::Combo("Density activation", (int*)&m_nerf.density_activation, NerfActivationStr);
+			ImGui::Combo("Cycle loss activation", (int*)&m_nerf.pos_activation, NerfActivationStr);
 			ImGui::SliderFloat("Cone angle", &m_nerf.cone_angle_constant, 0.0f, 1.0f/128.0f);
 			ImGui::SliderFloat("Depth supervision strength", &m_nerf.training.depth_supervision_lambda, 0.f, 1.f);
 
@@ -3747,8 +3748,9 @@ void Testbed::reset_network(bool clear_density_grid) {
 		json& dir_encoding_config = config["dir_encoding"];
 		json& rgb_network_config = config["rgb_network"];
 
-		//json& uv_encoding_config = config["uv_encoding"];
+		json& uv_encoding_config = config["uv_encoding"];
 		json& uv_network_config = config["uv_network"];
+		json& pos_network_config = config["pos_network"];
 
 		uint32_t n_dir_dims = 3;
 		uint32_t n_extra_dims = m_nerf.training.dataset.n_extra_dims();
@@ -3761,10 +3763,11 @@ void Testbed::reset_network(bool clear_density_grid) {
 				n_extra_dims,
 				dims.n_pos + 1, // The offset of 1 comes from the dt member variable of NerfCoordinate. HACKY
 				encoding_config,
-				//uv_encoding_config,
+				uv_encoding_config,
 				dir_encoding_config,
 				network_config,
 				uv_network_config,
+				pos_network_config,
 				rgb_network_config
 			));
 		}

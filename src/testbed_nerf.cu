@@ -323,6 +323,15 @@ __device__ vec2 network_to_uv_vec(const T& val) {
 	};
 }
 
+template <typename T>
+__device__ vec3 network_to_pos_vec(const T& val, ENerfActivation activation) {
+	return {
+		network_to_rgb(float(val[6]), activation),
+		network_to_rgb(float(val[7]), activation),
+		network_to_rgb(float(val[8]), activation),
+	};
+}
+
 __device__ vec3 warp_position(const vec3& pos, const BoundingBox& aabb) {
 	// return {tcnn::logistic(pos.x - 0.5f), tcnn::logistic(pos.y - 0.5f), tcnn::logistic(pos.z - 0.5f)};
 	// return pos;
@@ -1398,6 +1407,7 @@ __global__ void compute_loss_kernel_train_nerf(
 	float* __restrict__ max_level_compacted_ptr,
 	ENerfActivation rgb_activation,
 	ENerfActivation density_activation,
+	ENerfActivation cycle_loss_activation,
 	bool snap_to_pixel_centers,
 	float* __restrict__ error_map,
 	const float* __restrict__ cdf_x_cond_y,
@@ -1414,7 +1424,8 @@ __global__ void compute_loss_kernel_train_nerf(
 	const vec3* __restrict__ exposure,
 	vec3* __restrict__ exposure_gradient,
 	float depth_supervision_lambda,
-	float near_distance
+	float near_distance,
+	float cycle_loss_scale
 ) {
 	const uint32_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= *rays_counter) { return; }
@@ -1431,6 +1442,7 @@ __global__ void compute_loss_kernel_train_nerf(
 	float EPSILON = 1e-4f;
 
 	vec3 rgb_ray = vec3(0.0f);
+	vec3 loss_pos_ray = vec3(0.0f);
 	vec3 hitpoint = vec3(0.0f);
 
 	float depth_ray = 0.f;
@@ -1441,13 +1453,12 @@ __global__ void compute_loss_kernel_train_nerf(
 			break;
 		}
 
-		const tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 4>*)network_output;
+		const tcnn::vector_t<tcnn::network_precision_t, 9> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 9>*)network_output;
 		const vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 		const vec3 pos = unwarp_position(coords_in.ptr->pos.p, aabb);
 		const float dt = unwarp_dt(coords_in.ptr->dt);
 		float cur_depth = distance(pos, ray_o);
 		float density = network_to_density(float(local_network_output[3]), density_activation);
-
 
 		const float alpha = 1.f - __expf(-density * dt);
 		const float weight = alpha * T;
@@ -1455,6 +1466,10 @@ __global__ void compute_loss_kernel_train_nerf(
 		hitpoint += weight * pos;
 		depth_ray += weight * cur_depth;
 		T *= (1.f - alpha);
+
+		const vec3 inverse_pos = network_to_pos_vec(local_network_output, cycle_loss_activation);
+		LossAndGradient lg_cycle = loss_and_gradient(pos, inverse_pos, ELossType::L2);
+		loss_pos_ray += weight * lg_cycle.loss;
 
 		network_output += padded_output_width;
 		coords_in += 1;
@@ -1582,10 +1597,12 @@ __global__ void compute_loss_kernel_train_nerf(
 	loss_scale /= n_rays;
 
 	const float output_l2_reg = rgb_activation == ENerfActivation::Exponential ? 1e-4f : 0.0f;
+	const float cycle_loss_l2_reg = cycle_loss_activation == ENerfActivation::Exponential ? 1e-4f : 0.0f;
 	const float output_l1_reg_density = *mean_density_ptr < NERF_MIN_OPTICAL_THICKNESS() ? 1e-4f : 0.0f;
 
 	// now do it again computing gradients
 	vec3 rgb_ray2 = { 0.f,0.f,0.f };
+	vec3 loss_pos_ray2 = { 0.f,0.f,0.f };
 	float depth_ray2 = 0.f;
 	T = 1.f;
 	for (uint32_t j = 0; j < compacted_numsteps; ++j) {
@@ -1601,7 +1618,7 @@ __global__ void compute_loss_kernel_train_nerf(
 		float depth = distance(pos, ray_o);
 
 		float dt = unwarp_dt(coord_in->dt);
-		const tcnn::vector_t<tcnn::network_precision_t, 4> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 4>*)network_output;
+		const tcnn::vector_t<tcnn::network_precision_t, 9> local_network_output = *(tcnn::vector_t<tcnn::network_precision_t, 9>*)network_output;
 		const vec3 rgb = network_to_rgb_vec(local_network_output, rgb_activation);
 		const float density = network_to_density(float(local_network_output[3]), density_activation);
 		const float alpha = 1.f - __expf(-density * dt);
@@ -1614,19 +1631,31 @@ __global__ void compute_loss_kernel_train_nerf(
 		const vec3 suffix = rgb_ray - rgb_ray2;
 		const vec3 dloss_by_drgb = weight * lg.gradient;
 
-		tcnn::vector_t<tcnn::network_precision_t, 4> local_dL_doutput;
+		tcnn::vector_t<tcnn::network_precision_t, 9> local_dL_doutput;
 
 		// chain rule to go from dloss/drgb to dloss/dmlp_output
 		local_dL_doutput[0] = loss_scale * (dloss_by_drgb.x * network_to_rgb_derivative(local_network_output[0], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[0])); // Penalize way too large color values
 		local_dL_doutput[1] = loss_scale * (dloss_by_drgb.y * network_to_rgb_derivative(local_network_output[1], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[1]));
 		local_dL_doutput[2] = loss_scale * (dloss_by_drgb.z * network_to_rgb_derivative(local_network_output[2], rgb_activation) + fmaxf(0.0f, output_l2_reg * (float)local_network_output[2]));
 
+		//cycle loss
+		const vec3 inverse_pos = network_to_pos_vec(local_network_output, cycle_loss_activation);
+		LossAndGradient lg_cycle = loss_and_gradient(pos, inverse_pos, ELossType::L2);
+		const vec3 dloss_by_dpos = weight * lg_cycle.gradient;
+
+		local_dL_doutput[6] = loss_scale * cycle_loss_scale * (dloss_by_dpos.x * network_to_rgb_derivative(local_network_output[6], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[6]));
+		local_dL_doutput[7] = loss_scale * cycle_loss_scale * (dloss_by_dpos.y * network_to_rgb_derivative(local_network_output[7], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[7]));
+		local_dL_doutput[8] = loss_scale * cycle_loss_scale * (dloss_by_dpos.z * network_to_rgb_derivative(local_network_output[8], cycle_loss_activation) + fmaxf(0.0f, cycle_loss_l2_reg * (float)local_network_output[8]));
+
+		loss_pos_ray2 += weight * lg_cycle.loss;
+		const vec3 loss_pos_suffix = loss_pos_ray - loss_pos_ray2;
+
 		float density_derivative = network_to_density_derivative(float(local_network_output[3]), density_activation);
 		const float depth_suffix = depth_ray - depth_ray2;
 		const float depth_supervision = depth_loss_gradient * (T * depth - depth_suffix);
 
 		float dloss_by_dmlp = density_derivative * (
-			dt * (dot(lg.gradient, T * rgb - suffix) + depth_supervision)
+			dt * (dot(lg.gradient, T * rgb - suffix) + cycle_loss_scale * dot(vec3(1), T * lg_cycle.loss - loss_pos_suffix) + depth_supervision)
 		);
 
 		//static constexpr float mask_supervision_strength = 1.f; // we are already 'leaking' mask information into the nerf via the random bg colors; setting this to eg between 1 and  100 encourages density towards 0 in such regions.
@@ -1636,9 +1665,8 @@ __global__ void compute_loss_kernel_train_nerf(
 			loss_scale * dloss_by_dmlp +
 			(float(local_network_output[3]) < 0.0f ? -output_l1_reg_density : 0.0f) +
 			(float(local_network_output[3]) > -10.0f && depth < near_distance ? 1e-4f : 0.0f);
-			;
 
-		*(tcnn::vector_t<tcnn::network_precision_t, 4>*)dloss_doutput = local_dL_doutput;
+		*(tcnn::vector_t<tcnn::network_precision_t, 9>*)dloss_doutput = local_dL_doutput;
 
 		dloss_doutput += padded_output_width;
 		network_output += padded_output_width;
@@ -3220,10 +3248,6 @@ void Testbed::train_nerf(uint32_t target_batch_size, bool get_loss_scalar, cudaS
 }
 
 void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters& counters, cudaStream_t stream) {
-
-	//update some params
-	m_nerf_network->set_uv_network_scale(m_nerf.training.uv_network_scale);
-
 	const uint32_t padded_output_width = m_network->padded_output_width();
 	const uint32_t max_samples = target_batch_size * 16; // Somewhat of a worst case
 	const uint32_t floats_per_coord = sizeof(NerfCoordinate) / sizeof(float) + m_nerf_network->n_extra_dims();
@@ -3381,6 +3405,7 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			max_level_compacted,
 			m_nerf.rgb_activation,
 			m_nerf.density_activation,
+			m_nerf.pos_activation,
 			m_nerf.training.snap_to_pixel_centers,
 			accumulate_error ? m_nerf.training.error_map.data.data() : nullptr,
 			sample_focal_plane_proportional_to_error ? m_nerf.training.error_map.cdf_x_cond_y.data() : nullptr,
@@ -3397,7 +3422,8 @@ void Testbed::train_nerf_step(uint32_t target_batch_size, Testbed::NerfCounters&
 			m_nerf.training.cam_exposure_gpu.data(),
 			m_nerf.training.optimize_exposure ? m_nerf.training.cam_exposure_gradient_gpu.data() : nullptr,
 			m_nerf.training.depth_supervision_lambda,
-			m_nerf.training.near_distance
+			m_nerf.training.near_distance,
+			m_nerf.training.cycle_loss_scale
 		);
 
 	fill_rollover_and_rescale<network_precision_t><<<n_blocks_linear(target_batch_size*padded_output_width), n_threads_linear, 0, stream>>>(

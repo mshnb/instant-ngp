@@ -711,7 +711,7 @@ public:
 			uint32_t n_rays_since_error_map_update = 0;
 
 			float near_distance = 0.1f;
-			float uv_network_scale = 1.0f;
+			float cycle_loss_scale = 1.0f;
 			float density_grid_decay = 0.95f;
 			default_rng_t density_grid_rng;
 			int view = 0;
@@ -745,6 +745,7 @@ public:
 
 		ENerfActivation rgb_activation = ENerfActivation::Exponential;
 		ENerfActivation density_activation = ENerfActivation::Exponential;
+		ENerfActivation pos_activation = ENerfActivation::None;
 
 		vec3 light_dir = vec3(0.5f);
 		uint32_t extra_dim_idx_for_inference = 0; // which training image's latent code should be presented at inference time
